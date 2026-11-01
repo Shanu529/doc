@@ -1,0 +1,24 @@
+// Tests OUR code (batching, truncation reporting, request shape, citation checks) against a local mock of the provider API. It does not test model quality.
+import test from "node:test"; import assert from "node:assert/strict"; import http from "http"; import { PDFDocument } from "pdf-lib";
+import { checkCitations } from "../src/lib/citations";
+let calls: any[] = []; let truncate = false;
+const srv = http.createServer((q, r) => { let d = ""; q.on("data", (c) => (d += c)); q.on("end", async () => { const j = JSON.parse(d); calls.push({ headers: q.headers, body: j });
+  const doc = j.messages[0].content?.[0]; let n = 1; if (doc?.type === "document") n = (await PDFDocument.load(Buffer.from(doc.source.data, "base64"))).getPageCount();
+  r.setHeader("content-type", "application/json"); r.end(JSON.stringify({ content: [{ type: "text", text: Array.from({ length: n }, (_, i) => `text ${i + 1}`).join("\n<<<PAGE>>>\n") }], stop_reason: truncate ? "max_tokens" : "end_turn" })); }); });
+const pdfOf = async (pages: number) => { const d = await PDFDocument.create(); for (let i = 0; i < pages; i++) d.addPage(); return Buffer.from(await d.save()); };
+test("setup", async () => { await new Promise<void>((r) => srv.listen(0, r)); process.env.AI_BASE_URL = `http://127.0.0.1:${(srv.address() as any).port}`; process.env.AI_API_KEY = "secret-key"; process.env.OCR_MAX_PAGES = "10"; process.env.OCR_BATCH_PAGES = "4"; });
+test("OCR batches pages, keeps order, and sends the key only as a header", async () => { calls = []; const { ocr } = await import("../src/lib/ai"); const r = await ocr(await pdfOf(8), "application/pdf");
+  assert.equal(calls.length, 2); assert.equal(r.pages.length, 8); assert.equal(r.partial, false); assert.equal(calls[0].headers["x-api-key"], "secret-key"); assert.ok(!JSON.stringify(calls[0].body).includes("secret-key")); });
+test("OCR reports documents longer than the page cap as partially processed", async () => { calls = []; const { ocr } = await import("../src/lib/ai"); const r = await ocr(await pdfOf(25), "application/pdf");
+  assert.equal(r.partial, true); assert.match(r.note!, /first 10 of 25 pages/); assert.equal(r.pages.length, 10); assert.equal(calls.length, 3); });
+test("OCR reports truncated provider output", async () => { truncate = true; const { ocr } = await import("../src/lib/ai"); const r = await ocr(await pdfOf(3), "application/pdf"); truncate = false; assert.equal(r.partial, true); assert.match(r.note!, /cut off/); });
+test("OCR on an image works and flags truncation", async () => { const { ocr } = await import("../src/lib/ai"); const r = await ocr(Buffer.from("x"), "image/png"); assert.equal(r.pages.length, 1); assert.equal(r.partial, false); });
+test("provider errors surface as errors, not empty text", async () => { const { complete } = await import("../src/lib/ai"); process.env.AI_BASE_URL = "http://127.0.0.1:1"; await assert.rejects(() => complete("s", "u")); });
+test("teardown", () => { srv.close(); });
+const S = ["Hemoglobin 13.2 g/dL on 2024-03-09.", "Hemoglobin 11.8 g/dL on 2024-06-01."];
+test("citations: valid references and matching values pass cleanly", () => { const c = checkCitations("From your documents:\n- Hemoglobin was 13.2 g/dL [1]\n- Later it was 11.8 g/dL [2]", S); assert.deepEqual(c.warnings, []); assert.deepEqual(c.cited, [1, 2]); });
+test("citations: a value that is not in the cited source is flagged (incorrect)", () => { const c = checkCitations("From your documents:\n- Hemoglobin was 14.5 g/dL [1]", S); assert.deepEqual(c.unverifiedNumbers, ["14.5"]); assert.ok(c.warnings.length); });
+test("citations: a number cited to the wrong source is flagged", () => { assert.deepEqual(checkCitations("From your documents:\n- Hemoglobin was 11.8 g/dL [1]", S).unverifiedNumbers, ["11.8"]); });
+test("citations: references to nonexistent sources are marked and warned (missing)", () => { const c = checkCitations("From your documents:\n- Dose is 5 mg [7]", S); assert.deepEqual(c.invalid, [7]); assert.match(c.clean, /\[\?\]/); assert.ok(c.warnings.length); });
+test("citations: uncited statements are warned", () => assert.equal(checkCitations("From your documents:\n- Hemoglobin was 13.2 g/dL", S).uncited, 1));
+test("citations: contradictory sources both cited is accepted, interpretation lines are not checked", () => { const c = checkCitations("From your documents:\n- Value differs: 13.2 g/dL [1] vs 11.8 g/dL [2]\nAI interpretation (not stated in the documents):\n- This may be a decrease of 1.4", S); assert.deepEqual(c.warnings, []); });

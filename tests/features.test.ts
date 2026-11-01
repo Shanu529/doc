@@ -1,0 +1,6 @@
+import test from "node:test"; import assert from "node:assert/strict";
+import { extractDate, chunkPages, classify } from "../src/lib/process-classify"; import { buildPdf } from "../src/lib/pdf";
+test("extracts dates in common formats", () => { assert.equal(extractDate("Report date 2024-03-09"), "2024-03-09"); assert.equal(extractDate("Collected on 5 March 2023"), "2023-03-05"); assert.equal(extractDate("12/11/2022"), "2022-11-12"); assert.equal(extractDate("no date here"), null); assert.equal(extractDate("31/31/2022"), null); });
+test("chunks keep page numbers and respect the cap", () => { const c = chunkPages(["a".repeat(2500), "b".repeat(50)], 1200, 3).chunks; assert.equal(c.length, 3); assert.equal(c[2].page, 1); const t = chunkPages(["a".repeat(5000)], 1200, 2); assert.equal(t.chunks.length, 2); assert.equal(t.truncated, true); });
+test("unknown documents get zero confidence", () => assert.equal(classify("lorem ipsum").confidence, 0));
+test("doctor PDF builds and labels unverified data", async () => { const b = await buildPdf({ title: "Medical history summary", body: "None documented.\n".repeat(80), entries: [{ date: "2024-01-01", type: "lab_report", title: "CBC", confirmed: false }] }); assert.equal(Buffer.from(b).subarray(0, 5).toString(), "%PDF-"); });
